@@ -1,20 +1,16 @@
-name: nxnative - .nup a IPA
+name: nxnative - .nup (artefacto) a IPA
 
 on:
   workflow_dispatch:
     inputs:
-      file_id:
-        description: "ID del archivo de Google Drive"
-        required: true
-        default: "1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP"
       source_run_id:
-        description: "ID de una ejecución anterior con el artefacto nup-file (evita Google Drive)"
+        description: "Run ID que contiene el artefacto nup-file (vacío = el más reciente no expirado)"
         required: false
         default: ""
       expected_sha256:
         description: "SHA-256 esperado del .nup (vacío = no comprobar)"
         required: false
-        default: "77564a015812b18f2828c65d452d23e1e72911ab3d0d3cc2c44f2c506ed1f064"
+        default: ""
       min_size_mb:
         description: "Tamaño mínimo esperado del .nup (MB)"
         required: true
@@ -28,13 +24,17 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: read
+  actions: read
+
 env:
-  FILE_ID: ${{ github.event.inputs.file_id || '1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP' }}
   SOURCE_RUN_ID: ${{ github.event.inputs.source_run_id || '' }}
-  EXPECTED_SHA256: ${{ github.event.inputs.expected_sha256 || '77564a015812b18f2828c65d452d23e1e72911ab3d0d3cc2c44f2c506ed1f064' }}
+  EXPECTED_SHA256: ${{ github.event.inputs.expected_sha256 || '' }}
   MIN_SIZE_MB: ${{ github.event.inputs.min_size_mb || '50' }}
   BUILD_SCRIPT: ${{ github.event.inputs.build_script || '' }}
   EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
+  ARTIFACT_NAME: nup-file
   GAME_DIR: ${{ github.workspace }}/_game
   OUT_FILE: game.nup
 
@@ -89,57 +89,65 @@ jobs:
             pip install capstone lz4 fonttools
           fi
 
-      # ---------- DESCARGA ----------
-      - name: Descargar .nup desde artefacto anterior (sin Drive)
-        if: ${{ github.event.inputs.source_run_id != '' }}
+      # ---------- OBTENER .NUP DESDE ARTEFACTO ----------
+      - name: Localizar artefacto nup-file
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eo pipefail
+          if [ -n "$SOURCE_RUN_ID" ]; then
+            RUN_ID="$SOURCE_RUN_ID"
+          else
+            RUN_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty')
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No hay ningún artefacto '${ARTIFACT_NAME}' vigente (los artefactos expiran a los 7 días o según tu retención)."
+            gh api "repos/${{ github.repository }}/actions/artifacts?per_page=30" \
+              --jq '.artifacts[] | "\(.name)  expired=\(.expired)  run=\(.workflow_run.id)  \(.created_at)"' || true
+            exit 1
+          fi
+          echo "Usando run ID: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Descargar artefacto nup-file
         uses: actions/download-artifact@v4
         with:
           name: nup-file
           path: _game
           github-token: ${{ github.token }}
-          run-id: ${{ github.event.inputs.source_run_id }}
+          run-id: ${{ steps.find.outputs.run_id }}
           repository: ${{ github.repository }}
 
-      - name: Instalar gdown
-        if: ${{ github.event.inputs.source_run_id == '' }}
-        run: python3 -m pip install gdown --break-system-packages || python3 -m pip install gdown
-
-      - name: Descargar con gdown
-        id: gdown
-        if: ${{ github.event.inputs.source_run_id == '' }}
-        continue-on-error: true
+      - name: Verificar .nup (tamaño, formato, SHA-256)
         run: |
-          mkdir -p "$GAME_DIR"
-          python3 -m gdown --id "$FILE_ID" -O "$GAME_DIR/$OUT_FILE"
+          set -eo pipefail
+          echo "Contenido descargado:"; ls -lh "$GAME_DIR"
 
-      - name: Fallback con curl
-        if: ${{ github.event.inputs.source_run_id == '' && steps.gdown.outcome == 'failure' }}
-        run: |
-          mkdir -p "$GAME_DIR"
-          rm -f "$GAME_DIR/$OUT_FILE"
-          curl -L --fail --retry 5 --retry-delay 5 \
-            -o "$GAME_DIR/$OUT_FILE" \
-            "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t"
+          # El artefacto puede tener otro nombre de archivo: localizar el .nup
+          FOUND=$(find "$GAME_DIR" -type f -iname "*.nup" -print -quit)
+          [ -n "$FOUND" ] || { echo "::error::No hay ningún .nup dentro del artefacto"; exit 1; }
+          if [ "$FOUND" != "$GAME_DIR/$OUT_FILE" ]; then
+            mv "$FOUND" "$GAME_DIR/$OUT_FILE"
+          fi
 
-      - name: Verificar tamaño y formato
-        run: |
           F="$GAME_DIR/$OUT_FILE"
-          test -f "$F" || { echo "::error::No existe el archivo"; exit 1; }
           SIZE=$(stat -f%z "$F")
           MIN=$(( MIN_SIZE_MB * 1024 * 1024 ))
           echo "Tamaño: $SIZE bytes ($(( SIZE / 1024 / 1024 )) MB)"
           [ "$SIZE" -ge "$MIN" ] || { echo "::error::Archivo demasiado pequeño"; head -c 500 "$F"; exit 1; }
           if head -c 512 "$F" | grep -qiE "<html|<!doctype"; then
-            echo "::error::El archivo es HTML"; exit 1
+            echo "::error::El archivo es HTML (artefacto de una descarga fallida de Drive)"; exit 1
           fi
-          EXPECTED="${EXPECTED_SHA256#sha256:}"
+
           ACTUAL=$(shasum -a 256 "$F" | cut -d' ' -f1)
           echo "SHA256 calculado: $ACTUAL"
+          EXPECTED="${EXPECTED_SHA256#sha256:}"
           if [ -n "$EXPECTED" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
             echo "::error::SHA-256 distinto. Esperado: $EXPECTED"
             exit 1
           fi
-          echo "SHA-256 OK"
           df -h /
 
       # ---------- COMPILACIÓN ----------
@@ -183,8 +191,7 @@ jobs:
           [ -n "$IPA" ] || { echo "::error::No se generó ningún .ipa"; find "$GAME_DIR" -maxdepth 2 | head -40; exit 1; }
           cp "$IPA" dist/
           ls -lh dist/
-          ENTRIES=$(unzip -l dist/*.ipa | tail -1)
-          echo "Contenido: $ENTRIES"
+          echo "Contenido: $(unzip -l dist/*.ipa | tail -1)"
           df -h /
 
       - name: Subir IPA
