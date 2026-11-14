@@ -7,6 +7,14 @@ on:
         description: "ID del archivo de Google Drive"
         required: true
         default: "1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP"
+      source_run_id:
+        description: "ID de una ejecución anterior con el artefacto nup-file (evita Google Drive)"
+        required: false
+        default: ""
+      expected_sha256:
+        description: "SHA-256 esperado del .nup (vacío = no comprobar)"
+        required: false
+        default: "77564a015812b18f2828c65d452d23e1e72911ab3d0d3cc2c44f2c506ed1f064"
       min_size_mb:
         description: "Tamaño mínimo esperado del .nup (MB)"
         required: true
@@ -22,6 +30,8 @@ on:
 
 env:
   FILE_ID: ${{ github.event.inputs.file_id || '1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP' }}
+  SOURCE_RUN_ID: ${{ github.event.inputs.source_run_id || '' }}
+  EXPECTED_SHA256: ${{ github.event.inputs.expected_sha256 || '77564a015812b18f2828c65d452d23e1e72911ab3d0d3cc2c44f2c506ed1f064' }}
   MIN_SIZE_MB: ${{ github.event.inputs.min_size_mb || '50' }}
   BUILD_SCRIPT: ${{ github.event.inputs.build_script || '' }}
   EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
@@ -80,18 +90,30 @@ jobs:
           fi
 
       # ---------- DESCARGA ----------
+      - name: Descargar .nup desde artefacto anterior (sin Drive)
+        if: ${{ github.event.inputs.source_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: nup-file
+          path: _game
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.inputs.source_run_id }}
+          repository: ${{ github.repository }}
+
       - name: Instalar gdown
+        if: ${{ github.event.inputs.source_run_id == '' }}
         run: python3 -m pip install gdown --break-system-packages || python3 -m pip install gdown
 
       - name: Descargar con gdown
         id: gdown
+        if: ${{ github.event.inputs.source_run_id == '' }}
         continue-on-error: true
         run: |
           mkdir -p "$GAME_DIR"
           python3 -m gdown --id "$FILE_ID" -O "$GAME_DIR/$OUT_FILE"
 
       - name: Fallback con curl
-        if: steps.gdown.outcome == 'failure'
+        if: ${{ github.event.inputs.source_run_id == '' && steps.gdown.outcome == 'failure' }}
         run: |
           mkdir -p "$GAME_DIR"
           rm -f "$GAME_DIR/$OUT_FILE"
@@ -110,6 +132,14 @@ jobs:
           if head -c 512 "$F" | grep -qiE "<html|<!doctype"; then
             echo "::error::El archivo es HTML"; exit 1
           fi
+          EXPECTED="${EXPECTED_SHA256#sha256:}"
+          ACTUAL=$(shasum -a 256 "$F" | cut -d' ' -f1)
+          echo "SHA256 calculado: $ACTUAL"
+          if [ -n "$EXPECTED" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::SHA-256 distinto. Esperado: $EXPECTED"
+            exit 1
+          fi
+          echo "SHA-256 OK"
           df -h /
 
       # ---------- COMPILACIÓN ----------
