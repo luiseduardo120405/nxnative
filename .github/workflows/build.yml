@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: "Run ID que contiene el artefacto nup-file (vacío = el más reciente no expirado)"
+        description: "Run ID con el artefacto nup-file (vacío = el más reciente no expirado)"
         required: false
         default: ""
       expected_sha256:
@@ -20,20 +20,25 @@ on:
         required: false
         default: ""
       extra_args:
-        description: "Argumentos extra para el script (ej: --romfs separate)"
+        description: "Argumentos extra del script (ej: --allow-other-metal --romfs separate)"
         required: false
-        default: ""
+        default: "--allow-other-metal"
 
 permissions:
   contents: read
   actions: read
+
+# Evita dos builds de 25 GB a la vez
+concurrency:
+  group: nxnative-build
+  cancel-in-progress: false
 
 env:
   SOURCE_RUN_ID: ${{ github.event.inputs.source_run_id || '' }}
   EXPECTED_SHA256: ${{ github.event.inputs.expected_sha256 || '' }}
   MIN_SIZE_MB: ${{ github.event.inputs.min_size_mb || '50' }}
   BUILD_SCRIPT: ${{ github.event.inputs.build_script || '' }}
-  EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
+  EXTRA_ARGS: ${{ github.event.inputs.extra_args || '--allow-other-metal' }}
   ARTIFACT_NAME: nup-file
   GAME_DIR: ${{ github.workspace }}/_game
   OUT_FILE: game.nup
@@ -50,49 +55,53 @@ jobs:
           submodules: recursive
 
       # ---------- ENTORNO ----------
-      - name: Info del runner y espacio en disco
+      - name: Seleccionar Xcode más reciente y liberar espacio
         run: |
           sw_vers
-          xcodebuild -version || true
-          ls -d /Applications/Xcode*.app || true
           df -h /
 
-      - name: Seleccionar el Xcode más reciente
-        run: |
-          LATEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$LATEST" ]; then
             sudo xcode-select -s "$LATEST/Contents/Developer"
+            # Borrar las demás versiones de Xcode libera decenas de GB
+            for X in /Applications/Xcode_*.app; do
+              [ "$X" != "$LATEST" ] && sudo rm -rf "$X"
+            done
           fi
           xcodebuild -version
 
-      - name: Liberar espacio (simuladores y caches)
-        run: |
           sudo rm -rf ~/Library/Developer/CoreSimulator/Devices/* 2>/dev/null || true
-          xcrun simctl delete all 2>/dev/null || true
+          xcrun simctl runtime delete all 2>/dev/null || true
           brew cleanup -s 2>/dev/null || true
           df -h /
 
-      - name: Instalar Python 3.12 (zbit no tiene paquetes para 3.15)
+      - name: Instalar Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Instalar herramientas de build
+      - name: Instalar herramientas y módulos de Python
         run: |
+          set -eo pipefail
           if [ -f Brewfile ]; then
             brew bundle --file=Brewfile
           else
             brew install xcodegen zstd spirv-cross glslang
             brew install --cask dotnet-sdk || true
           fi
+
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install capstone lz4 fonttools
-          fi
+          [ -f requirements.txt ] && pip install -r requirements.txt
+
+          # Versiones que pide el script (el paquete de PyPI es zbic, no zbit)
+          pip install zbic "capstone>=5,<6" fonttools zstandard lz4
+          pip install backports.zstd || echo "::warning::backports.zstd no se pudo instalar"
+
+          python --version
+          pip list | grep -iE "zbic|capstone|fonttools|zstandard|zstd|lz4" || true
+          python -c "import zbic, capstone, fontTools, zstandard; print('módulos OK')"
 
       # ---------- OBTENER .NUP DESDE ARTEFACTO ----------
       - name: Localizar artefacto nup-file
@@ -108,7 +117,7 @@ jobs:
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty')
           fi
           if [ -z "$RUN_ID" ]; then
-            echo "::error::No hay ningún artefacto '${ARTIFACT_NAME}' vigente (los artefactos expiran a los 7 días o según tu retención)."
+            echo "::error::No hay ningún artefacto '${ARTIFACT_NAME}' vigente (expiran según la retención)."
             gh api "repos/${{ github.repository }}/actions/artifacts?per_page=30" \
               --jq '.artifacts[] | "\(.name)  expired=\(.expired)  run=\(.workflow_run.id)  \(.created_at)"' || true
             exit 1
@@ -128,14 +137,11 @@ jobs:
       - name: Verificar .nup (tamaño, formato, SHA-256)
         run: |
           set -eo pipefail
-          echo "Contenido descargado:"; ls -lh "$GAME_DIR"
+          ls -lh "$GAME_DIR"
 
-          # El artefacto puede tener otro nombre de archivo: localizar el .nup
           FOUND=$(find "$GAME_DIR" -type f -iname "*.nup" -print -quit)
           [ -n "$FOUND" ] || { echo "::error::No hay ningún .nup dentro del artefacto"; exit 1; }
-          if [ "$FOUND" != "$GAME_DIR/$OUT_FILE" ]; then
-            mv "$FOUND" "$GAME_DIR/$OUT_FILE"
-          fi
+          [ "$FOUND" = "$GAME_DIR/$OUT_FILE" ] || mv "$FOUND" "$GAME_DIR/$OUT_FILE"
 
           F="$GAME_DIR/$OUT_FILE"
           SIZE=$(stat -f%z "$F")
@@ -143,41 +149,21 @@ jobs:
           echo "Tamaño: $SIZE bytes ($(( SIZE / 1024 / 1024 )) MB)"
           [ "$SIZE" -ge "$MIN" ] || { echo "::error::Archivo demasiado pequeño"; head -c 500 "$F"; exit 1; }
           if head -c 512 "$F" | grep -qiE "<html|<!doctype"; then
-            echo "::error::El archivo es HTML (artefacto de una descarga fallida de Drive)"; exit 1
+            echo "::error::El archivo es HTML (descarga fallida de Drive)"; exit 1
           fi
 
           ACTUAL=$(shasum -a 256 "$F" | cut -d' ' -f1)
           echo "SHA256 calculado: $ACTUAL"
           EXPECTED="${EXPECTED_SHA256#sha256:}"
           if [ -n "$EXPECTED" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "::error::SHA-256 distinto. Esperado: $EXPECTED"
-            exit 1
+            echo "::error::SHA-256 distinto. Esperado: $EXPECTED"; exit 1
           fi
           df -h /
 
       # ---------- COMPILACIÓN ----------
-      - name: Instalar módulos de Python requeridos por el script
+      - name: Localizar script y mostrar sus opciones
         run: |
-          set -eo pipefail
           source .venv/bin/activate
-          python --version
-          pip install --upgrade pip
-          # El paquete de PyPI se llama zbic (no zbit)
-          pip install zbic "capstone>=5,<6" fonttools zstandard
-          pip install backports.zstd || echo "::warning::backports.zstd no se pudo instalar"
-          pip list | grep -iE "zbic|capstone|fonttools|zstandard|zstd" || true
-
-          echo "--- Cómo importa el repo estos módulos ---"
-          grep -rnE "import (zbit|zbic)|from (zbit|zbic)|zbit|zbic" scripts engine/scripts 2>/dev/null | head -10 || true
-
-          python -c "import zbic, capstone, fontTools, zstandard; print('módulos OK')"
-          python -c "import zbit" 2>/dev/null && echo "zbit importable" || echo "::warning::'import zbit' falla; si el script lo exige, revisa el grep de arriba"
-
-      - name: Compilar IPA con nxnative
-        run: |
-          set -eo pipefail
-          source .venv/bin/activate
-
           if [ -n "$BUILD_SCRIPT" ]; then
             SCRIPT="$BUILD_SCRIPT"
           elif [ -f scripts/build_ipa_from_nsp.py ]; then
@@ -189,10 +175,19 @@ jobs:
             find . -name "*.py" -path "*scripts*" -maxdepth 3 | head -30
             exit 1
           fi
+          echo "SCRIPT=$SCRIPT" >> "$GITHUB_ENV"
           echo "Script: $SCRIPT"
+          python "$SCRIPT" --help 2>&1 | head -80 || true
 
-          # Los .nup (Switch 2) no necesitan prod.keys.
-          # Si tu juego sí los necesita, añade el secret PROD_KEYS_B64 (base64 de prod.keys).
+      - name: Compilar IPA con nxnative
+        env:
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          set -eo pipefail
+          source .venv/bin/activate
+
+          # Los .nup de Switch 2 no necesitan prod.keys.
+          # Si tu juego sí, añade el secret PROD_KEYS_B64 (base64 de prod.keys).
           KEYS_ARG=""
           if [ -n "${PROD_KEYS_B64:-}" ]; then
             echo "$PROD_KEYS_B64" | base64 --decode > "$RUNNER_TEMP/prod.keys"
@@ -200,9 +195,7 @@ jobs:
           fi
 
           # El script escribe el IPA en la misma carpeta que la entrada
-          python3 "$SCRIPT" "$GAME_DIR/$OUT_FILE" $KEYS_ARG $EXTRA_ARGS
-        env:
-          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+          python "$SCRIPT" "$GAME_DIR/$OUT_FILE" $KEYS_ARG $EXTRA_ARGS
 
       # ---------- RESULTADO ----------
       - name: Localizar y verificar IPA
@@ -213,7 +206,15 @@ jobs:
           [ -n "$IPA" ] || { echo "::error::No se generó ningún .ipa"; find "$GAME_DIR" -maxdepth 2 | head -40; exit 1; }
           cp "$IPA" dist/
           ls -lh dist/
-          echo "Contenido: $(unzip -l dist/*.ipa | tail -1)"
+          ENTRIES=$(unzip -l dist/*.ipa | tail -1)
+          echo "Contenido: $ENTRIES"
+          {
+            echo "### IPA generado"
+            echo "- Archivo: \`$(basename "$IPA")\`"
+            echo "- Tamaño: $(du -h dist/*.ipa | cut -f1)"
+            echo "- Contenido del zip: $ENTRIES"
+            echo "- Firmar antes de instalar (AltStore, SideStore, etc.)"
+          } >> "$GITHUB_STEP_SUMMARY"
           df -h /
 
       - name: Subir IPA
@@ -230,6 +231,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: _game/_build/**/*.log
+          path: |
+            _game/**/*.log
+            _game/*_build/**/*.txt
           if-no-files-found: ignore
           retention-days: 7
