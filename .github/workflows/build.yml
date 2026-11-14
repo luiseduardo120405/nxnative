@@ -59,25 +59,63 @@ jobs:
         run: |
           sw_vers
           xcodebuild -version || true
-          ls -d /Applications/Xcode*.app || true
+          ls -ld /Applications/Xcode* || true
           df -h /
 
-      - name: Seleccionar el Xcode más reciente
+      - name: Liberar espacio y seleccionar Xcode (antes de descargar el .nup)
         run: |
-          LATEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$LATEST" ]; then
-            sudo xcode-select -s "$LATEST/Contents/Developer"
+          set -eo pipefail
+          echo "== Espacio ANTES (volumen de datos) =="
+          df -h /System/Volumes/Data
+
+          # 1) Elegir el Xcode más nuevo (ruta real, sin enlaces simbólicos)
+          LATEST=""
+          for X in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V); do
+            if [ -x "$X/Contents/Developer/usr/bin/xcodebuild" ]; then
+              LATEST="$(cd "$X" && pwd -P)"
+            fi
+          done
+          if [ -z "$LATEST" ]; then
+            echo "::error::No encontré ningún Xcode completo en /Applications"; exit 1
           fi
+          echo "Xcode elegido: $LATEST"
+          sudo xcode-select -s "$LATEST/Contents/Developer"
+          export DEVELOPER_DIR="$LATEST/Contents/Developer"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
           xcodebuild -version
           echo "XVER=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_ENV"
           xcrun metal --version || true
 
-      - name: Liberar espacio (simuladores y caches)
-        run: |
-          sudo rm -rf ~/Library/Developer/CoreSimulator/Devices/* 2>/dev/null || true
-          xcrun simctl delete all 2>/dev/null || true
+          # 2) Borrar las demás versiones de Xcode (solo carpetas reales, nunca el elegido)
+          for X in /Applications/Xcode*.app; do
+            if [ -L "$X" ]; then continue; fi
+            R="$(cd "$X" && pwd -P)"
+            if [ "$R" = "$LATEST" ]; then continue; fi
+            echo "Borrando $X"
+            sudo rm -rf "$X" || true
+          done
+          xcodebuild -version   # comprobar que sigue funcionando
+
+          # 3) Otros candidatos a borrar (no hacen falta para compilar el IPA)
+          xcrun simctl runtime delete all 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* 2>/dev/null || true
+          sudo rm -rf "$HOME/Library/Developer/CoreSimulator" 2>/dev/null || true
+          sudo rm -rf "$HOME/Library/Android" /usr/local/lib/android 2>/dev/null || true
+          sudo rm -rf "$HOME/Library/Caches/"* 2>/dev/null || true
           brew cleanup -s 2>/dev/null || true
-          df -h /
+
+          echo "== Espacio DESPUÉS (volumen de datos) =="
+          df -h /System/Volumes/Data
+          FREE_GB=$(df -g /System/Volumes/Data | awk 'NR==2{print $4}')
+          echo "Libres: ${FREE_GB} GB"
+          # Hace falta: ~25 GB del .nup + 30 GB libres que exige el script, y más para el IPA
+          if [ "$FREE_GB" -lt 60 ]; then
+            echo "::error::Solo hay ${FREE_GB} GB libres; con un .nup de 25 GB el script exige 30 GB libres tras descargarlo. Se cancela antes de descargar."
+            exit 1
+          fi
+          if [ "$FREE_GB" -lt 105 ]; then
+            echo "::warning::${FREE_GB} GB libres: puede alcanzar para descomprimir pero quedar justo al empaquetar el IPA (~25 GB). Considera --romfs separate."
+          fi
 
       - name: Instalar Python 3.12
         uses: actions/setup-python@v5
