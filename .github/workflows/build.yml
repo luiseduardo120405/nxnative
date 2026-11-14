@@ -1,36 +1,85 @@
-name: Build Switch 2 IPA
+name: Descargar .nup desde Google Drive
 
 on:
   workflow_dispatch:
+    inputs:
+      file_id:
+        description: "ID del archivo de Google Drive"
+        required: true
+        default: "1ch_DMA-ElCVMPFk000NtN63FMqabQCP"
+      min_size_mb:
+        description: "Tamaño mínimo esperado (MB)"
+        required: true
+        default: "50"
+  push:
+    branches: [main]
+
+env:
+  FILE_ID: ${{ github.event.inputs.file_id || '1ch_DMA-ElCVMPFk000NtN63FMqabQCP' }}
+  MIN_SIZE_MB: ${{ github.event.inputs.min_size_mb || '50' }}
+  OUT_FILE: game.nup
 
 jobs:
-  build:
+  download:
     runs-on: macos-latest
+    timeout-minutes: 60
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Instalar gdown
         run: |
-          brew install xcodegen zstd glslang
-          python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic
+          python3 -m pip install --upgrade pip --break-system-packages || true
+          python3 -m pip install gdown --break-system-packages || python3 -m pip install gdown
 
-      - name: Download ROM from Google Drive
+      - name: Descargar con gdown
+        id: gdown
+        continue-on-error: true
         run: |
-          mkdir -p game_rom
-          curl -L "https://drive.google.com/uc?export=download&id=1ch_DMA-ElCVMPFk000NtN63FMqabQCP" -o game_rom/zelda.nup
+          mkdir -p build
+          python3 -m gdown --id "$FILE_ID" -O "build/$OUT_FILE"
 
-      - name: Build IPA
+      - name: Fallback con curl (omite el aviso de virus)
+        if: steps.gdown.outcome == 'failure'
         run: |
-          python3 scripts/build_ipa_from_nsp.py game_rom/zelda.nup --output build_output
+          mkdir -p build
+          rm -f "build/$OUT_FILE"
+          curl -L --fail --retry 5 --retry-delay 5 \
+            -o "build/$OUT_FILE" \
+            "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t"
 
-      - name: Upload IPA Artifact
+      - name: Verificar tamaño y formato
+        run: |
+          F="build/$OUT_FILE"
+          test -f "$F" || { echo "::error::No existe el archivo"; exit 1; }
+
+          # macOS: stat -f%z (en Linux sería stat -c%s)
+          SIZE=$(stat -f%z "$F")
+          MIN=$(( MIN_SIZE_MB * 1024 * 1024 ))
+          echo "Tamaño: $SIZE bytes ($(( SIZE / 1024 / 1024 )) MB)"
+
+          if [ "$SIZE" -lt "$MIN" ]; then
+            echo "::error::Archivo menor a ${MIN_SIZE_MB} MB; probablemente se descargó una página HTML."
+            head -c 500 "$F"
+            exit 1
+          fi
+
+          if head -c 512 "$F" | grep -qiE "<html|<!doctype"; then
+            echo "::error::El archivo es HTML (bloqueo de Drive / cuota excedida / permisos)."
+            exit 1
+          fi
+
+          echo "Tipo: $(file -b "$F")"
+          echo "Primeros bytes:"
+          xxd -l 32 "$F"
+          echo "SHA256: $(shasum -a 256 "$F" | cut -d' ' -f1)"
+
+      - name: Subir artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: Zelda-Remake-iOS
-          path: build_output/*.ipa
+          name: nup-file
+          path: build/${{ env.OUT_FILE }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
