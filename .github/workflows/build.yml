@@ -257,14 +257,23 @@ jobs:
           path: _game/0400486024DEC000_build/shader
           key: ios-shaders-${{ runner.os }}-${{ env.XVER }}-${{ github.run_id }}
 
-      - name: Localizar y verificar IPA
+      - name: Localizar IPA, liberar espacio y verificar
         run: |
           set -eo pipefail
-          mkdir -p dist
           IPA=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" -print -quit)
           [ -n "$IPA" ] || { echo "::error::No se generó ningún .ipa"; find "$GAME_DIR" -maxdepth 2 | head -40; exit 1; }
-          cp "$IPA" dist/
+          ls -lh "$IPA"
+
+          # El IPA ya está hecho (27 GB): borrar lo que ya no hace falta para tener espacio.
+          # (La caché de shaders ya se guardó en el paso anterior y el .nup sigue en su artefacto.)
+          rm -rf "$GAME_DIR"/*_build/extract "$GAME_DIR/$OUT_FILE"
+          df -h /System/Volumes/Data
+
+          # mv, no cp: en el mismo volumen es un renombrado y no duplica 27 GB
+          mkdir -p dist
+          mv "$IPA" dist/
           ls -lh dist/
+
           ENTRIES=$(unzip -l dist/*.ipa | tail -1)
           echo "Contenido: $ENTRIES"
           {
@@ -272,9 +281,8 @@ jobs:
             echo "- Archivo: \`$(basename "$IPA")\`"
             echo "- Tamaño: $(du -h dist/*.ipa | cut -f1)"
             echo "- Contenido del zip: $ENTRIES"
-            echo "- Firmar antes de instalar (AltStore, SideStore, etc.)"
+            echo "- Sin firmar: hay que firmarlo antes de instalar"
           } >> "$GITHUB_STEP_SUMMARY"
-          df -h /
 
       - name: Subir IPA
         uses: actions/upload-artifact@v4
