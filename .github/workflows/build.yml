@@ -6,7 +6,7 @@ on:
       file_id:
         description: "ID del archivo de Google Drive"
         required: true
-        default: "1ch_DMA-ElCVMPFk000NtN63FMqabQCP"
+        default: "1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP"
       min_size_mb:
         description: "Tamaño mínimo esperado (MB)"
         required: true
@@ -15,7 +15,7 @@ on:
     branches: [main]
 
 env:
-  FILE_ID: ${{ github.event.inputs.file_id || '1ch_DMA-ElCVMPFk000NtN63FMqabQCP' }}
+  FILE_ID: ${{ github.event.inputs.file_id || '1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP' }}
   MIN_SIZE_MB: ${{ github.event.inputs.min_size_mb || '50' }}
   OUT_FILE: game.nup
 
