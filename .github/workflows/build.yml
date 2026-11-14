@@ -1,4 +1,4 @@
-name: Descargar .nup desde Google Drive
+name: nxnative - .nup a IPA
 
 on:
   workflow_dispatch:
@@ -8,78 +8,169 @@ on:
         required: true
         default: "1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP"
       min_size_mb:
-        description: "Tamaño mínimo esperado (MB)"
+        description: "Tamaño mínimo esperado del .nup (MB)"
         required: true
         default: "50"
-  push:
-    branches: [main]
+      build_script:
+        description: "Script de build (vacío = scripts/build_ipa_from_nsp.py o engine/scripts/...)"
+        required: false
+        default: ""
+      extra_args:
+        description: "Argumentos extra para el script (ej: --romfs separate)"
+        required: false
+        default: ""
 
 env:
   FILE_ID: ${{ github.event.inputs.file_id || '1Ch_DMA-EICVmPFkO00NtN63FMQmabQCP' }}
   MIN_SIZE_MB: ${{ github.event.inputs.min_size_mb || '50' }}
+  BUILD_SCRIPT: ${{ github.event.inputs.build_script || '' }}
+  EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
+  GAME_DIR: ${{ github.workspace }}/_game
   OUT_FILE: game.nup
 
 jobs:
-  download:
+  build:
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Instalar gdown
+      # ---------- ENTORNO ----------
+      - name: Info del runner y espacio en disco
         run: |
-          python3 -m pip install --upgrade pip --break-system-packages || true
-          python3 -m pip install gdown --break-system-packages || python3 -m pip install gdown
+          sw_vers
+          xcodebuild -version || true
+          ls -d /Applications/Xcode*.app || true
+          df -h /
+
+      - name: Seleccionar el Xcode más reciente
+        run: |
+          LATEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$LATEST" ]; then
+            sudo xcode-select -s "$LATEST/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: Liberar espacio (simuladores y caches)
+        run: |
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Devices/* 2>/dev/null || true
+          xcrun simctl delete all 2>/dev/null || true
+          brew cleanup -s 2>/dev/null || true
+          df -h /
+
+      - name: Instalar herramientas de build
+        run: |
+          if [ -f Brewfile ]; then
+            brew bundle --file=Brewfile
+          else
+            brew install xcodegen zstd spirv-cross glslang
+            brew install --cask dotnet-sdk || true
+          fi
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install capstone lz4 fonttools
+          fi
+
+      # ---------- DESCARGA ----------
+      - name: Instalar gdown
+        run: python3 -m pip install gdown --break-system-packages || python3 -m pip install gdown
 
       - name: Descargar con gdown
         id: gdown
         continue-on-error: true
         run: |
-          mkdir -p build
-          python3 -m gdown --id "$FILE_ID" -O "build/$OUT_FILE"
+          mkdir -p "$GAME_DIR"
+          python3 -m gdown --id "$FILE_ID" -O "$GAME_DIR/$OUT_FILE"
 
-      - name: Fallback con curl (omite el aviso de virus)
+      - name: Fallback con curl
         if: steps.gdown.outcome == 'failure'
         run: |
-          mkdir -p build
-          rm -f "build/$OUT_FILE"
+          mkdir -p "$GAME_DIR"
+          rm -f "$GAME_DIR/$OUT_FILE"
           curl -L --fail --retry 5 --retry-delay 5 \
-            -o "build/$OUT_FILE" \
+            -o "$GAME_DIR/$OUT_FILE" \
             "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t"
 
       - name: Verificar tamaño y formato
         run: |
-          F="build/$OUT_FILE"
+          F="$GAME_DIR/$OUT_FILE"
           test -f "$F" || { echo "::error::No existe el archivo"; exit 1; }
-
-          # macOS: stat -f%z (en Linux sería stat -c%s)
           SIZE=$(stat -f%z "$F")
           MIN=$(( MIN_SIZE_MB * 1024 * 1024 ))
           echo "Tamaño: $SIZE bytes ($(( SIZE / 1024 / 1024 )) MB)"
-
-          if [ "$SIZE" -lt "$MIN" ]; then
-            echo "::error::Archivo menor a ${MIN_SIZE_MB} MB; probablemente se descargó una página HTML."
-            head -c 500 "$F"
-            exit 1
-          fi
-
+          [ "$SIZE" -ge "$MIN" ] || { echo "::error::Archivo demasiado pequeño"; head -c 500 "$F"; exit 1; }
           if head -c 512 "$F" | grep -qiE "<html|<!doctype"; then
-            echo "::error::El archivo es HTML (bloqueo de Drive / cuota excedida / permisos)."
+            echo "::error::El archivo es HTML"; exit 1
+          fi
+          df -h /
+
+      # ---------- COMPILACIÓN ----------
+      - name: Compilar IPA con nxnative
+        run: |
+          set -eo pipefail
+          source .venv/bin/activate
+
+          if [ -n "$BUILD_SCRIPT" ]; then
+            SCRIPT="$BUILD_SCRIPT"
+          elif [ -f scripts/build_ipa_from_nsp.py ]; then
+            SCRIPT=scripts/build_ipa_from_nsp.py
+          elif [ -f engine/scripts/build_ipa_from_nsp.py ]; then
+            SCRIPT=engine/scripts/build_ipa_from_nsp.py
+          else
+            echo "::error::No encontré build_ipa_from_nsp.py. Indica build_script."
+            find . -name "*.py" -path "*scripts*" -maxdepth 3 | head -30
             exit 1
           fi
+          echo "Script: $SCRIPT"
 
-          echo "Tipo: $(file -b "$F")"
-          echo "Primeros bytes:"
-          xxd -l 32 "$F"
-          echo "SHA256: $(shasum -a 256 "$F" | cut -d' ' -f1)"
+          # Los .nup (Switch 2) no necesitan prod.keys.
+          # Si tu juego sí los necesita, añade el secret PROD_KEYS_B64 (base64 de prod.keys).
+          KEYS_ARG=""
+          if [ -n "${PROD_KEYS_B64:-}" ]; then
+            echo "$PROD_KEYS_B64" | base64 --decode > "$RUNNER_TEMP/prod.keys"
+            KEYS_ARG="-k $RUNNER_TEMP/prod.keys"
+          fi
 
-      - name: Subir artefacto
+          # El script escribe el IPA en la misma carpeta que la entrada
+          python3 "$SCRIPT" "$GAME_DIR/$OUT_FILE" $KEYS_ARG $EXTRA_ARGS
+        env:
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+
+      # ---------- RESULTADO ----------
+      - name: Localizar y verificar IPA
+        run: |
+          set -eo pipefail
+          mkdir -p dist
+          IPA=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" -print -quit)
+          [ -n "$IPA" ] || { echo "::error::No se generó ningún .ipa"; find "$GAME_DIR" -maxdepth 2 | head -40; exit 1; }
+          cp "$IPA" dist/
+          ls -lh dist/
+          ENTRIES=$(unzip -l dist/*.ipa | tail -1)
+          echo "Contenido: $ENTRIES"
+          df -h /
+
+      - name: Subir IPA
         uses: actions/upload-artifact@v4
         with:
-          name: nup-file
-          path: build/${{ env.OUT_FILE }}
+          name: ipa
+          path: dist/*.ipa
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
+
+      - name: Subir logs de build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: _game/_build/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
