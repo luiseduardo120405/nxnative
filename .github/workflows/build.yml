@@ -45,7 +45,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 360
 
     steps:
@@ -69,6 +69,8 @@ jobs:
             sudo xcode-select -s "$LATEST/Contents/Developer"
           fi
           xcodebuild -version
+          echo "XVER=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_ENV"
+          xcrun metal --version || true
 
       - name: Liberar espacio (simuladores y caches)
         run: |
@@ -181,6 +183,15 @@ jobs:
           echo "Script: $SCRIPT"
           python "$SCRIPT" --help 2>&1 | head -80 || true
 
+      - name: Restaurar shaders iOS de un build anterior (si existen)
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: _game/0400486024DEC000_build/shader
+          key: ios-shaders-${{ runner.os }}-${{ env.XVER }}-${{ github.run_id }}
+          restore-keys: |
+            ios-shaders-${{ runner.os }}-${{ env.XVER }}-
+
       - name: Compilar IPA con nxnative
         env:
           PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
@@ -200,6 +211,14 @@ jobs:
           python "$SCRIPT" "$GAME_DIR/$OUT_FILE" $KEYS_ARG $EXTRA_ARGS
 
       # ---------- RESULTADO ----------
+      - name: Guardar shaders iOS en caché (evita repetir ~2,5 h)
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: _game/0400486024DEC000_build/shader
+          key: ios-shaders-${{ runner.os }}-${{ env.XVER }}-${{ github.run_id }}
+
       - name: Localizar y verificar IPA
         run: |
           set -eo pipefail
