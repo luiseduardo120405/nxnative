@@ -151,6 +151,18 @@ jobs:
           df -h /
 
       # ---------- COMPILACIÓN ----------
+      - name: Instalar módulos de Python requeridos por el script
+        run: |
+          set -eo pipefail
+          source .venv/bin/activate
+          python --version
+          pip install --upgrade pip
+          pip install zbit "capstone>=5,<6" fonttools zstandard
+          # backports.zstd solo existe/aplica en Python < 3.14; si no se puede instalar, se avisa y se sigue
+          pip install backports.zstd || echo "::warning::backports.zstd no se pudo instalar (¿Python >= 3.14?)"
+          pip list | grep -iE "zbit|capstone|fonttools|zstandard|zstd" || true
+          python -c "import zbit, capstone, fontTools, zstandard; print('módulos OK')"
+
       - name: Compilar IPA con nxnative
         run: |
           set -eo pipefail
