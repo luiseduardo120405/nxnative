@@ -162,11 +162,16 @@ jobs:
           source .venv/bin/activate
           python --version
           pip install --upgrade pip
-          pip install zbit "capstone>=5,<6" fonttools zstandard
-          # backports.zstd solo existe/aplica en Python < 3.14; si no se puede instalar, se avisa y se sigue
-          pip install backports.zstd || echo "::warning::backports.zstd no se pudo instalar (¿Python >= 3.14?)"
-          pip list | grep -iE "zbit|capstone|fonttools|zstandard|zstd" || true
-          python -c "import zbit, capstone, fontTools, zstandard; print('módulos OK')"
+          # El paquete de PyPI se llama zbic (no zbit)
+          pip install zbic "capstone>=5,<6" fonttools zstandard
+          pip install backports.zstd || echo "::warning::backports.zstd no se pudo instalar"
+          pip list | grep -iE "zbic|capstone|fonttools|zstandard|zstd" || true
+
+          echo "--- Cómo importa el repo estos módulos ---"
+          grep -rnE "import (zbit|zbic)|from (zbit|zbic)|zbit|zbic" scripts engine/scripts 2>/dev/null | head -10 || true
+
+          python -c "import zbic, capstone, fontTools, zstandard; print('módulos OK')"
+          python -c "import zbit" 2>/dev/null && echo "zbit importable" || echo "::warning::'import zbit' falla; si el script lo exige, revisa el grep de arriba"
 
       - name: Compilar IPA con nxnative
         run: |
