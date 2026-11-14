@@ -55,23 +55,25 @@ jobs:
           submodules: recursive
 
       # ---------- ENTORNO ----------
-      - name: Seleccionar Xcode más reciente y liberar espacio
+      - name: Info del runner, Xcode y espacio en disco
         run: |
           sw_vers
+          xcodebuild -version || true
+          ls -d /Applications/Xcode*.app || true
           df -h /
 
-          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+      - name: Seleccionar el Xcode más reciente
+        run: |
+          LATEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$LATEST" ]; then
             sudo xcode-select -s "$LATEST/Contents/Developer"
-            # Borrar las demás versiones de Xcode libera decenas de GB
-            for X in /Applications/Xcode_*.app; do
-              [ "$X" != "$LATEST" ] && sudo rm -rf "$X"
-            done
           fi
           xcodebuild -version
 
+      - name: Liberar espacio (simuladores y caches)
+        run: |
           sudo rm -rf ~/Library/Developer/CoreSimulator/Devices/* 2>/dev/null || true
-          xcrun simctl runtime delete all 2>/dev/null || true
+          xcrun simctl delete all 2>/dev/null || true
           brew cleanup -s 2>/dev/null || true
           df -h /
 
