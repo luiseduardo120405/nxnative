@@ -72,6 +72,11 @@ jobs:
           brew cleanup -s 2>/dev/null || true
           df -h /
 
+      - name: Instalar Python 3.12 (zbit no tiene paquetes para 3.15)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Instalar herramientas de build
         run: |
           if [ -f Brewfile ]; then
@@ -80,7 +85,7 @@ jobs:
             brew install xcodegen zstd spirv-cross glslang
             brew install --cask dotnet-sdk || true
           fi
-          python3 -m venv .venv
+          python3.12 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
           if [ -f requirements.txt ]; then
